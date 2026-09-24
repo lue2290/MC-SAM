@@ -28,6 +28,8 @@ def main():
     parser.add_argument("--model_type", type=str, default="vit_h", help="模型类型")
     parser.add_argument("--device", type=str, default="cuda:0", help="设备")
     parser.add_argument("--threshold", type=float, default=0.5, help="阈值")
+    parser.add_argument("--use_rankdice", action="store_true",
+                        help="启用推理期 RankDice-RMA；省略时输出固定阈值实验使用的概率图")
     parser.add_argument("--save_dir", type=str, default="result", help="结果保存目录")
     parser.add_argument("--visualize", action="store_true", help="是否可视化结果")
 
@@ -56,7 +58,7 @@ def main():
         cspg_temperature=args.cspg_temperature,
         cspg_iters=args.cspg_iters,
         image_size=1024,
-        use_rankdice=True,
+        use_rankdice=args.use_rankdice,
         use_hypercond=True,
         n_streams=4,
         mca_bottleneck_dim=saved_args.get("mca_bottleneck_dim", 128),

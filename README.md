@@ -61,6 +61,8 @@ python inference_mcsam.py \
 
 This script expects paired images and masks because it uses the same dataset reader as the validation code. It saves a prediction for each sample. The model checkpoint records the training arguments; loading is strict so an incompatible architecture raises an error.
 
+By default, inference saves the probability maps used for the fixed-threshold comparison in manuscript Table 2. Add `--use_rankdice` to apply the inference-only RankDice-RMA selector, as in the final row of manuscript Table 3. Run the two modes with separate `--save_dir` values to avoid mixing their predictions. The `--threshold` argument supplies the HyperCond condition; it does not turn RankDice-RMA on or off.
+
 ## Parameter accounting
 
 Run `python count_model_parameters.py` from the repository root. For ViT-H, 128-dimensional shared MCA and rank-48 alignment, the integrated segmentation model contains **642,183,656** parameters: **5,151,388 trainable** and **637,032,268 frozen**. The count includes the trainable SAM mask decoder and counts the shared MCA once. Separately loaded frozen BLIP and Mamba models are outside this total. The count script uses a meta device and does not load a checkpoint or run training.

@@ -40,19 +40,11 @@ class SinkhornProjection(nn.Module):
 
 # ==================== 2. 改进的RankDice-RMA 模块 ====================
 class RankDiceRMAModule(nn.Module):
-    """改进的RankDice-RMA训练和推理模块"""
+    """Parameter-free inference-only RankDice-RMA selector."""
 
-    def __init__(self, use_in_training=True, weight=0.1, eps=1e-8):
+    def __init__(self, eps=1e-8):
         super().__init__()
-        self.use_in_training = use_in_training
-        self.weight = weight
         self.eps = eps
-
-        # 添加温度参数
-        self.temperature = nn.Parameter(torch.tensor(0.1))
-
-        # 学习率调度
-        self.register_buffer('step', torch.tensor(0))
 
     def compute_optimal_threshold(self, prob_map):
         """计算最优阈值"""
@@ -82,44 +74,10 @@ class RankDiceRMAModule(nn.Module):
         return torch.stack(thresholds)
 
     def forward(self, logits, gt_mask=None):
-        """
-        计算RankDice-RMA损失或生成推理掩码
-        """
-        if self.training and gt_mask is not None and self.use_in_training:
-            return self._compute_rank_dice_loss(logits, gt_mask)
-        else:
-            return self._inference(logits)
-
-    def _compute_rank_dice_loss(self, logits, gt_mask):
-        """计算RankDice-RMA损失"""
-        prob_map = torch.sigmoid(logits)
-        batch_size = prob_map.shape[0]
-
-        # 计算每个样本的最优阈值
-        thresholds = self.compute_optimal_threshold(prob_map)
-
-        total_loss = 0.0
-        for i in range(batch_size):
-            single_prob = prob_map[i, 0]
-            single_gt = gt_mask[i, 0]
-            threshold_value = thresholds[i]
-
-            # [C3修复] 使用可微分的软阈值代替硬阈值，确保梯度可以回传
-            temp = torch.clamp(self.temperature, min=0.01)
-            pred_mask = torch.sigmoid((single_prob - threshold_value) / temp)
-
-            # 计算Dice损失
-            intersection = (pred_mask * single_gt).sum()
-            union = pred_mask.sum() + single_gt.sum() + self.eps
-            dice = (2.0 * intersection + self.eps) / union
-
-            dice_loss = 1.0 - dice
-            total_loss += dice_loss
-
-        rank_dice_loss = (total_loss / batch_size) * self.weight
-        self.step += 1
-
-        return logits, rank_dice_loss
+        """Inference-only selector; labels never enter mask selection."""
+        if self.training:
+            return logits
+        return self._inference(logits)
 
     def _inference(self, logits):
         """推理时使用RankDice-RMA生成掩码"""
@@ -138,73 +96,31 @@ class RankDiceRMAModule(nn.Module):
 
 # ==================== 3. 改进的超参数条件化模块 ====================
 class HyperCondModule(nn.Module):
-    """改进的超参数条件化模块"""
+    """Threshold-only conditioning, injected into the dense prompt."""
 
     def __init__(self, cond_dim=128, hidden_dim=64):
         super().__init__()
         self.cond_dim = cond_dim
-        self.hidden_dim = hidden_dim
-
-        # 阈值和边界权重编码器
         self.threshold_encoder = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, cond_dim // 2)
-        )
-
-        self.boundary_encoder = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, cond_dim // 2)
-        )
-
-        # 条件融合网络
+            nn.Linear(1, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU(),
+            nn.Linear(hidden_dim, cond_dim))
         self.fusion_net = nn.Sequential(
-            nn.Linear(cond_dim, cond_dim * 2),
-            nn.LayerNorm(cond_dim * 2),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(cond_dim * 2, cond_dim),
-            nn.LayerNorm(cond_dim),
-            nn.Tanh()
-        )
+            nn.Linear(cond_dim, cond_dim * 2), nn.LayerNorm(cond_dim * 2),
+            nn.GELU(), nn.Dropout(0.1), nn.Linear(cond_dim * 2, cond_dim),
+            nn.LayerNorm(cond_dim), nn.Tanh())
+        for layer in self.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_uniform_(layer.weight)
+                nn.init.zeros_(layer.bias)
 
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(self, threshold, boundary_weight, device, batch_size=1):
-        # 确保输入为tensor并扩展批次维度
-        if not isinstance(threshold, torch.Tensor):
-            threshold = torch.tensor([threshold], dtype=torch.float32)
-        if not isinstance(boundary_weight, torch.Tensor):
-            boundary_weight = torch.tensor([boundary_weight], dtype=torch.float32)
-
-        # 扩展批次维度
-        threshold = threshold.to(device).view(-1, 1)
-        boundary_weight = boundary_weight.to(device).view(-1, 1)
-
-        if threshold.shape[0] == 1 and batch_size > 1:
+    def forward(self, threshold, device, batch_size=1):
+        threshold = torch.as_tensor(threshold, dtype=self.threshold_encoder[0].weight.dtype,
+                                    device=device).reshape(-1, 1)
+        if threshold.shape[0] == 1:
             threshold = threshold.expand(batch_size, -1)
-        if boundary_weight.shape[0] == 1 and batch_size > 1:
-            boundary_weight = boundary_weight.expand(batch_size, -1)
-
-        # 编码
-        threshold_enc = self.threshold_encoder(threshold)
-        boundary_enc = self.boundary_encoder(boundary_weight)
-
-        # 拼接和融合
-        cond = torch.cat([threshold_enc, boundary_enc], dim=-1)
-        cond = self.fusion_net(cond)
-
-        return cond
+        if threshold.shape[0] != batch_size:
+            raise ValueError("Threshold batch does not match image batch")
+        return self.fusion_net(self.threshold_encoder(threshold))
 
 
 # ==================== 4. RMS归一化层 ====================
@@ -221,31 +137,56 @@ class RMSNorm(nn.Module):
         return self.scale * x / norm
 
 
+class LowRankLinear(nn.Module):
+    """Bias-free low-rank weight factorization followed by one output bias."""
+
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        if not 0 < rank <= min(in_features, out_features):
+            raise ValueError("rank must be positive and no larger than input/output dimensions")
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.up(self.down(x))
+
+
+class DepthwiseSeparableConv(nn.Sequential):
+    """3x3 depthwise convolution plus 1x1 pointwise projection."""
+
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1,
+                      groups=in_channels, bias=False),
+            nn.Conv2d(in_channels, out_channels, 1, bias=True),
+        )
+
+
 # ==================== 5. 改进的流形约束超连接适配器 ====================
 class ManifoldConstrainedAdapter(nn.Module):
-    """改进的流形约束超连接适配器"""
+    """共享的瓶颈 MCA；分支生成和 Sinkhorn 混合均在低维空间完成。"""
 
-    def __init__(self, embed_dim, n_streams=4, sinkhorn_iters=20):
+    def __init__(self, embed_dim, n_streams=4, sinkhorn_iters=20, bottleneck_dim=128):
         super().__init__()
         self.n_streams = n_streams
         self.sinkhorn_iters = sinkhorn_iters
         self.embed_dim = embed_dim
+        self.bottleneck_dim = bottleneck_dim
 
-        # 输入调整层
+        # 2560 -> d（vit_h）；拼接特征先进入低维瓶颈。
         self.input_adjust = nn.Sequential(
-            nn.Linear(2 * embed_dim, embed_dim),
+            nn.Linear(2 * embed_dim, bottleneck_dim),
             nn.GELU(),
             nn.Dropout(0.1)
         )
 
-        # RMS归一化
-        self.norm = RMSNorm(embed_dim)
+        self.norm = RMSNorm(bottleneck_dim)
 
-        # 适配器MLP：生成n个残差分支
+        # 在低维空间生成 n 个残差分支。
         self.adapter_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(bottleneck_dim, bottleneck_dim),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim * n_streams)
+            nn.Linear(bottleneck_dim, bottleneck_dim * n_streams)
         )
 
         # 可学习门控参数
@@ -253,10 +194,13 @@ class ManifoldConstrainedAdapter(nn.Module):
 
         # 混合矩阵生成器
         self.mixing_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 4),
+            nn.Linear(bottleneck_dim, max(bottleneck_dim // 4, n_streams)),
             nn.GELU(),
-            nn.Linear(embed_dim // 4, n_streams * n_streams)
+            nn.Linear(max(bottleneck_dim // 4, n_streams), n_streams * n_streams)
         )
+
+        # d -> SAM 通道数，仅在所有低维分支完成混合后升维。
+        self.output_adjust = nn.Linear(bottleneck_dim, embed_dim)
 
         # Sinkhorn投影层
         self.sinkhorn = SinkhornProjection(iters=sinkhorn_iters)
@@ -278,7 +222,9 @@ class ManifoldConstrainedAdapter(nn.Module):
 
         # 生成未约束的适配器输出
         raw_residual = self.adapter_mlp(combined)
-        raw_residual = raw_residual.view(B, N, self.n_streams, C)
+        raw_residual = raw_residual.view(
+            B, N, self.n_streams, self.bottleneck_dim
+        )
 
         # 构造双随机矩阵
         mixing_scores = self.mixing_mlp(combined)
@@ -298,6 +244,7 @@ class ManifoldConstrainedAdapter(nn.Module):
         # 加权合并n个流
         alpha_gate = F.softmax(self.alpha, dim=0)
         final_residual = torch.einsum('s,bnsc->bnc', alpha_gate, mixed_residual)
+        final_residual = self.output_adjust(final_residual)
 
         # 恒等映射残差连接
         output = sam_features + 0.1 * final_residual  # 使用较小的权重
@@ -307,207 +254,50 @@ class ManifoldConstrainedAdapter(nn.Module):
 
 # ==================== 6. 改进的跨空间稳定的Vision-Language Prompt生成器 ====================
 class CrossModalStablePromptGenerator(nn.Module):
-    """改进的跨空间稳定的Vision-Language Prompt生成器"""
+    """Two projected streams, Gram-affinity Sinkhorn mixing and column-softmax post-mapping."""
 
-    def __init__(
-            self,
-            text_dim: int = 768,
-            vision_dim: int = 768,
-            prompt_dim: int = 256,
-            n_prompt: int = 2,
-            use_sinkhorn: bool = True,
-            sinkhorn_iters: int = 3,
-            debug: bool = False,
-    ):
+    def __init__(self, text_dim=768, vision_dim=768, prompt_dim=256,
+                 n_prompt=2, use_sinkhorn=True, sinkhorn_iters=5, debug=False,
+                 sinkhorn_temperature=1.0, projection_rank=48):
         super().__init__()
+        if n_prompt != 2:
+            raise ValueError("CSPG requires exactly two streams")
+        if sinkhorn_temperature <= 0 or sinkhorn_iters < 1:
+            raise ValueError("Positive temperature and iteration count are required")
         self.n_prompt = n_prompt
         self.prompt_dim = prompt_dim
-        self.text_dim = text_dim
-        self.vision_dim = vision_dim
         self.use_sinkhorn = use_sinkhorn
-        self.debug = debug
-
-        # 投影矩阵
-        self.W_text = nn.Linear(text_dim, prompt_dim, bias=True)
-        self.W_vision = nn.Linear(vision_dim, prompt_dim, bias=True)
-
-        # 可学习的流重要性权重
-        self.stream_weights = nn.Parameter(torch.tensor([0.5, 0.5]))
-
-        # 模态权重控制器
-        self.modality_controller = nn.Sequential(
-            nn.Linear(text_dim + vision_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2),
-            nn.Softmax(dim=-1)
-        )
-
-        # 混合比例参数
-        self.base_alpha = nn.Parameter(torch.tensor(0.0))
-        self.base_beta = nn.Parameter(torch.tensor(0.0))
-
-        # 归一化层
-        self.rms_norm = RMSNorm(prompt_dim)
-
-        # Sinkhorn投影
-        self.sinkhorn = SinkhornProjection(iters=sinkhorn_iters) if use_sinkhorn else None
-
-        # 监控指标
+        self.sinkhorn_temperature = sinkhorn_temperature
+        self.W_text = LowRankLinear(text_dim, prompt_dim, projection_rank)
+        self.W_vision = LowRankLinear(vision_dim, prompt_dim, projection_rank)
+        self.sinkhorn = SinkhornProjection(iters=sinkhorn_iters)
+        self.post_mapping = nn.Linear(2 * prompt_dim, 4)
         self.register_buffer('text_ratio', torch.tensor(0.0))
         self.register_buffer('vision_ratio', torch.tensor(0.0))
 
-        # 学习率预热
-        self.register_buffer('step', torch.tensor(0))
-        self.warmup_steps = 1000
+    def compute_H_pre(self, prompts):
+        u = F.normalize(prompts, p=2, dim=-1)
+        affinity = u @ u.transpose(-1, -2)
+        # SinkhornProjection accepts costs: -A/epsilon gives exp(A/epsilon).
+        scores = affinity / self.sinkhorn_temperature
+        return self.sinkhorn(-scores) if self.use_sinkhorn else scores.softmax(dim=-1)
 
-        self._init_weights()
+    def compute_H_post(self, mixed):
+        scores = self.post_mapping(mixed.flatten(1)).reshape(-1, 2, 2)
+        return scores.softmax(dim=-2)  # Each column sums to one.
 
-    def _init_weights(self):
-        """初始化权重"""
-        nn.init.xavier_normal_(self.W_text.weight, gain=0.3)
-        nn.init.xavier_normal_(self.W_vision.weight, gain=1.0)
-
+    def forward(self, text_embed, vision_embed, text_features=None, vision_features=None):
+        prompts = torch.stack((self.W_text(text_embed), self.W_vision(vision_embed)), dim=1)
+        h_pre = self.compute_H_pre(prompts)
+        mixed = h_pre @ prompts
+        h_post = self.compute_H_post(mixed)
         with torch.no_grad():
-            self.W_text.bias.data.uniform_(-0.1, 0.1)
-            self.W_vision.bias.data.uniform_(-0.1, 0.1)
-            nn.init.xavier_normal_(self.modality_controller[0].weight)
-            nn.init.xavier_normal_(self.modality_controller[2].weight)
-
-    def get_lr_multiplier(self):
-        """获取学习率乘子"""
-        if self.step < self.warmup_steps:
-            return float(self.step) / self.warmup_steps
-        return 1.0
-
-    def compute_H_pre(self, text_score, vision_score, text_features, vision_features):
-        """计算预映射矩阵 H_pre"""
-        B = text_score.shape[0]
-
-        # 提取全局特征
-        if len(text_features.shape) == 3:
-            text_global = text_features.mean(dim=1)
-        else:
-            text_global = text_features
-
-        if len(vision_features.shape) == 4:
-            if vision_features.shape[-1] == self.vision_dim:
-                vision_global = vision_features.mean(dim=[1, 2])
-            elif vision_features.shape[1] == self.vision_dim:
-                vision_global = vision_features.mean(dim=[2, 3])
-            else:
-                vision_global = vision_features.view(B, -1, self.vision_dim).mean(dim=1)
-        elif len(vision_features.shape) == 3:
-            vision_global = vision_features.mean(dim=1)
-        else:
-            vision_global = vision_features
-
-        # 调整维度
-        if vision_global.shape[-1] != self.vision_dim:
-            vision_global = vision_global.view(B, -1)
-            if vision_global.shape[-1] > self.vision_dim:
-                # 使用自适应平均池化
-                vision_global = vision_global.view(B, self.vision_dim, -1).mean(dim=-1)
-            elif vision_global.shape[-1] < self.vision_dim:
-                padding = torch.zeros(B, self.vision_dim - vision_global.shape[-1]).to(vision_global.device)
-                vision_global = torch.cat([vision_global, padding], dim=-1)
-
-        # 通过控制器计算模态权重
-        combined = torch.cat([text_global, vision_global], dim=-1)
-        modality_weights = self.modality_controller(combined)
-
-        # 基于原始得分的softmax
-        scores = torch.cat([text_score, vision_score], dim=-1)
-        temperature = 0.5
-        raw_probs = torch.softmax(scores / temperature, dim=-1)
-
-        # 结合两种方法
-        alpha_base = 0.5 + 0.5 * torch.sigmoid(self.base_alpha)
-        beta_base = 0.5 + 0.5 * torch.sigmoid(self.base_beta)
-
-        text_ratio = alpha_base * modality_weights[:, 0:1] + (1 - alpha_base) * raw_probs[:, 0:1]
-        vision_ratio = beta_base * modality_weights[:, 1:2] + (1 - beta_base) * raw_probs[:, 1:2]
-
-        # 范围限制
-        text_ratio = 0.4 + 0.2 * torch.sigmoid(text_ratio)
-        vision_ratio = 0.4 + 0.2 * torch.sigmoid(vision_ratio)
-
-        # 构建H_pre矩阵
-        H_pre = torch.zeros(B, self.n_prompt, self.n_prompt, device=text_score.device)
-        H_pre[:, 0, 0] = text_ratio.squeeze()
-        H_pre[:, 0, 1] = 1.0 - text_ratio.squeeze()
-        H_pre[:, 1, 0] = 1.0 - vision_ratio.squeeze()
-        H_pre[:, 1, 1] = vision_ratio.squeeze()
-
-        # 应用Sinkhorn约束（如果启用）
-        if self.use_sinkhorn and self.sinkhorn is not None:
-            H_pre = self.sinkhorn(H_pre)
-
-        # 监控增益比
-        text_ratio_val = H_pre[:, 0, 0].mean().detach()
-        vision_ratio_val = H_pre[:, 1, 1].mean().detach()
-
-        self.text_ratio.copy_(text_ratio_val)
-        self.vision_ratio.copy_(vision_ratio_val)
-
-        return H_pre, text_ratio_val, vision_ratio_val
-
-    def compute_H_post(self):
-        """计算后映射矩阵 H_post"""
-        H_post = torch.softmax(self.stream_weights * 2.0, dim=0)
-        return H_post
-
-    def forward(self, text_embed, vision_embed, text_features, vision_features):
-        """前向传播"""
-        B = text_embed.shape[0]
-
-        # 投影到统一空间
-        text_proj = self.W_text(text_embed)
-        vision_proj = self.W_vision(vision_embed)
-
-        # 计算模态得分
-        text_score = torch.mean(text_proj, dim=-1, keepdim=True) + torch.std(text_proj, dim=-1, keepdim=True) * 0.5
-        vision_score = torch.max(vision_proj, dim=-1, keepdim=True)[0] + torch.min(vision_proj, dim=-1, keepdim=True)[
-            0] * 0.5
-
-        # 计算 H_pre 和增益比
-        H_pre, text_ratio, vision_ratio = self.compute_H_pre(
-            text_score, vision_score, text_features, vision_features
-        )
-
-        # 构造输入流并应用 H_pre
-        input_streams = torch.stack([text_proj, vision_proj], dim=1)
-        mixed_streams = torch.einsum('bnk,bkd->bnd', H_pre, input_streams)
-
-        # 计算 H_post
-        H_post = self.compute_H_post()
-
-        # [S1修复] 保留多个prompt token，不合并为单一向量
-        # 使用 H_post 作为缩放权重但保持 n_prompt 维度
-        # mixed_streams: [B, n_prompt, prompt_dim]
-        sparse_prompt = mixed_streams * H_post.unsqueeze(0).unsqueeze(-1)  # [B, n_prompt, prompt_dim]
-
-        # 对每个prompt token分别归一化
-        prompt_list = []
-        for i in range(self.n_prompt):
-            prompt_list.append(self.rms_norm(sparse_prompt[:, i, :]))
-        sparse_prompt = torch.stack(prompt_list, dim=1)  # [B, n_prompt, prompt_dim]
-
-        # 更新步数
-        if self.training:
-            self.step += 1
-
-        return sparse_prompt
+            self.text_ratio.copy_(h_pre[:, 0, 0].mean())
+            self.vision_ratio.copy_(h_pre[:, 1, 1].mean())
+        return h_post.transpose(-1, -2) @ mixed
 
     def apply_gradient_constraints(self):
-        """应用梯度约束"""
-        if hasattr(self, 'stream_weights') and self.stream_weights.grad is not None:
-            torch.nn.utils.clip_grad_norm_([self.stream_weights], max_norm=1.0)
-
-        # 约束模态控制器和基础参数的梯度
-        for name, param in self.named_parameters():
-            if param.grad is not None and (
-                    'modality_controller' in name or 'base_alpha' in name or 'base_beta' in name):
-                torch.nn.utils.clip_grad_norm_([param], max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
 
 # ==================== 7. 改进的边界感知损失函数 ====================
@@ -853,6 +643,8 @@ class IntegratedImageEncoderViT(nn.Module):
             global_attn_indexes: Tuple[int, ...] = (),
             n_streams: int = 4,
             blip_feature_dim: int = 768,
+            mca_bottleneck_dim: int = 128,
+            projection_rank: int = 48,
     ) -> None:
         super().__init__()
         self.img_size = img_size
@@ -902,9 +694,8 @@ class IntegratedImageEncoderViT(nn.Module):
             LayerNorm2d(out_chans),
         )
 
-        # 流形约束超连接适配器
+        # 三个插入位置引用同一个 MCA 实例，共享全部权重。
         self.n_streams = n_streams
-        self.manifold_adapters = nn.ModuleList()
 
         # 动态决定哪些层添加适配器
         adapter_layers = []
@@ -915,19 +706,18 @@ class IntegratedImageEncoderViT(nn.Module):
                 if idx < depth:
                     adapter_layers.append(idx)
 
-        for i in range(depth):
-            if i in adapter_layers:
-                self.manifold_adapters.append(
-                    ManifoldConstrainedAdapter(embed_dim, n_streams=n_streams)
-                )
-            else:
-                self.manifold_adapters.append(None)
+        self.adapter_layers = tuple(adapter_layers)
+        self.shared_manifold_adapter = ManifoldConstrainedAdapter(
+            embed_dim,
+            n_streams=n_streams,
+            bottleneck_dim=mca_bottleneck_dim,
+        )
 
-        # BLIP特征调整层
+        # 低秩 BLIP 特征对齐：768 -> r -> SAM embed_dim。
         self.blip_feature_adjust = nn.Sequential(
-            nn.Conv2d(blip_feature_dim, embed_dim, 1),
+            nn.Conv2d(blip_feature_dim, projection_rank, 1, bias=False),
             nn.GELU(),
-            nn.Conv2d(embed_dim, embed_dim, 1),
+            nn.Conv2d(projection_rank, embed_dim, 1),
             nn.GELU()
         )
 
@@ -1002,16 +792,18 @@ class IntegratedImageEncoderViT(nn.Module):
                 blip_features_prepared = blip_features_prepared.reshape(B, H * W, C)
 
         # 多模态特征融合
-        for i, (blk, adapter) in enumerate(zip(self.blocks, self.manifold_adapters)):
+        for i, blk in enumerate(self.blocks):
             x = blk(x)
 
             # 在特定层进行流形约束特征融合
-            if adapter is not None and blip_features_prepared is not None:
+            if i in self.adapter_layers and blip_features_prepared is not None:
                 # 重塑SAM特征
                 x_reshaped = x.reshape(B, H * W, C)
 
                 # 应用流形约束适配器
-                x_reshaped = adapter(x_reshaped, blip_features_prepared)
+                x_reshaped = self.shared_manifold_adapter(
+                    x_reshaped, blip_features_prepared
+                )
 
                 # 重塑回原始维度
                 x = x_reshaped.reshape(B, H, W, C)
@@ -1033,6 +825,9 @@ class MMSAM_Integrated(nn.Module):
             use_rankdice=True,
             use_hypercond=True,
             n_streams=4,
+            cspg_temperature=1.0,
+            cspg_iters=5,
+            projection_rank=48,
     ):
         super().__init__()
         self.image_encoder = image_encoder
@@ -1052,7 +847,9 @@ class MMSAM_Integrated(nn.Module):
             prompt_dim=256,
             n_prompt=2,
             use_sinkhorn=True,
-            sinkhorn_iters=5,
+            sinkhorn_iters=cspg_iters,
+            sinkhorn_temperature=cspg_temperature,
+            projection_rank=projection_rank,
             debug=False
         )
 
@@ -1061,20 +858,13 @@ class MMSAM_Integrated(nn.Module):
             self.hyper_cond = HyperCondModule(cond_dim=128, hidden_dim=64)
             self.cond_channel_adapter = nn.Conv2d(128, 256, kernel_size=1, bias=False)
             self.cond_spatial_adapter = nn.Sequential(
-                nn.Conv2d(256, 256, 3, padding=1),
+                DepthwiseSeparableConv(256, 256),
                 nn.GELU()
             )
 
         # 3. RankDice-RMA模块
         if use_rankdice:
-            self.rankdice_module = RankDiceRMAModule(use_in_training=True, weight=0.1)
-
-        # 文本和图像适配器
-        self.text_adapter = nn.Sequential(
-            nn.Linear(768, 256),
-            nn.GELU(),
-            nn.Dropout(0.1)
-        )
+            self.rankdice_module = RankDiceRMAModule()
 
         # 图像特征投影层（用于维度对齐）
         self.image_feature_projection = nn.Sequential(
@@ -1083,9 +873,9 @@ class MMSAM_Integrated(nn.Module):
         ) if image_feature_dim != 768 else nn.Identity()
 
         self.pseudo_mask_embed = nn.Sequential(
-            nn.Conv2d(256, 256, 3, 1, 1),
+            DepthwiseSeparableConv(256, 256),
             nn.GELU(),
-            nn.Conv2d(256, 256, 3, 1, 1),
+            DepthwiseSeparableConv(256, 256),
             nn.GELU()
         )
 
@@ -1097,7 +887,7 @@ class MMSAM_Integrated(nn.Module):
     def _init_weights(self):
         """[C2修复] 只初始化MC-SAM新增的模块，不覆盖预训练权重"""
         # 明确列出需要初始化的新增模块，避免破坏 image_encoder 和 mask_decoder 的预训练权重
-        new_modules = [self.text_adapter, self.pseudo_mask_embed]
+        new_modules = [self.pseudo_mask_embed]
         
         # image_feature_projection 可能是 Identity，检查一下
         if not isinstance(self.image_feature_projection, nn.Identity):
@@ -1126,11 +916,11 @@ class MMSAM_Integrated(nn.Module):
             text_embeddings: 文本特征 [B, seq_len, 768]
             image_features: 图像特征 [B, seq_len, hidden_dim] 或 [B, C, H, W]
             gt_mask: 训练时的真实掩码 [B, 1, H, W]
-            hyper_cond: 超参数条件化字典 {'threshold': tau, 'boundary_weight': lambda_val}
+            hyper_cond: 超参数条件化字典 {'threshold': t}
             return_logits: 是否返回logits而不是最终掩码
         Returns:
             pred_mask: 预测掩码 [B, 1, H, W]
-            rank_dice_loss: RankDice-RMA损失（训练时）
+            rank_dice_loss: zero compatibility placeholder (no training loss)
             hyper_cond: 使用的超参数条件
         """
         B = image.shape[0]
@@ -1164,19 +954,18 @@ class MMSAM_Integrated(nn.Module):
 
         # ========== 2. 超参数条件化 ==========
         if hyper_cond is None:
-            hyper_cond = {'threshold': 0.5, 'boundary_weight': 1.0}
+            hyper_cond = {'threshold': 0.5}
 
         threshold = hyper_cond['threshold']
-        boundary_weight = hyper_cond['boundary_weight']
 
         # ========== 3. 图像编码器 ==========
         image_embedding = self.image_encoder(image, image_features_for_sam)
 
         # ========== 4. 超参数条件注入 ==========
-        # [S3修复] 推理时也使用HyperCond，利用默认参数(tau=0.5, lambda=1.0)生成条件嵌入
+        # Threshold-only conditioning is used in training and inference.
         cond_embedding = None
         if self.use_hypercond:
-            cond_embedding = self.hyper_cond(threshold, boundary_weight, image_embedding.device, B)
+            cond_embedding = self.hyper_cond(threshold, image_embedding.device, B)
 
         # ========== 5. 提取文本和视觉的全局特征 ==========
         text_global = text_embeddings.mean(dim=1)
@@ -1240,8 +1029,6 @@ class MMSAM_Integrated(nn.Module):
 
         if self.training:
             # 训练模式
-            if self.use_rankdice and gt_mask is not None:
-                logits, rank_dice_loss = self.rankdice_module(logits, gt_mask)
 
             if return_logits:
                 return logits, rank_dice_loss, hyper_cond
@@ -1283,13 +1070,17 @@ class MMSAM_Integrated(nn.Module):
 # ==================== 10. 创建集成模型的函数 ====================
 def create_integrated_model(
         sam_checkpoint_path,
-        model_type="vit_l",
+        model_type="vit_h",
         image_size=1024,
         use_rankdice=True,
         use_hypercond=True,
         n_streams=4,
         device="cuda",
-        blip_feature_dim=768
+        blip_feature_dim=768,
+        cspg_temperature=1.0,
+        cspg_iters=5,
+        mca_bottleneck_dim=128,
+        projection_rank=48,
 ):
     """创建集成模型"""
     from segment_anything import sam_model_registry
@@ -1347,13 +1138,15 @@ def create_integrated_model(
         window_size=window_size,
         global_attn_indexes=global_attn_indexes,
         n_streams=n_streams,
-        blip_feature_dim=blip_feature_dim
+        blip_feature_dim=blip_feature_dim,
+        mca_bottleneck_dim=mca_bottleneck_dim,
+        projection_rank=projection_rank,
     )
 
     # ===== [C1修复] 从SAM预训练模型迁移权重到集成编码器 =====
     # IntegratedImageEncoderViT 与 SAM 的 ImageEncoderViT 共享相同的
     # patch_embed, pos_embed, blocks, neck 结构，只额外增加了
-    # manifold_adapters 和 blip_feature_adjust（这些保持随机初始化）
+    # shared_manifold_adapter 和 blip_feature_adjust（这些保持随机初始化）
     sam_encoder_state = sam_model.image_encoder.state_dict()
     integrated_encoder_state = image_encoder.state_dict()
 
@@ -1383,12 +1176,19 @@ def create_integrated_model(
         image_encoder=image_encoder,
         mask_decoder=sam_model.mask_decoder,
         prompt_encoder=sam_model.prompt_encoder,
+        cspg_temperature=cspg_temperature,
+        cspg_iters=cspg_iters,
         image_feature_dim=blip_feature_dim,
         use_rankdice=use_rankdice,
         use_hypercond=use_hypercond,
         n_streams=n_streams,
+        projection_rank=projection_rank,
     ).to(device)
 
+    # Freeze original SAM components; retain the MCA structure unchanged.
+    for name, parameter in integrated_model.image_encoder.named_parameters():
+        parameter.requires_grad_(any(k in name for k in ("adapter", "blip_feature_adjust")))
+    integrated_model.prompt_encoder.requires_grad_(False)
     return integrated_model
 
 
@@ -1401,7 +1201,7 @@ def create_optimizer_for_integrated_model(model, lr=0.0002, weight_decay=0.01):
     # 1. 图像编码器适配器层（较高学习率）
     encoder_adapter_params = []
     for name, param in model.named_parameters():
-        if 'image_encoder' in name and ('adapter' in name or 'manifold_adapters' in name or 'blip_feature_adjust' in name):
+        if 'image_encoder' in name and ('adapter' in name or 'blip_feature_adjust' in name):
             encoder_adapter_params.append(param)
 
     if encoder_adapter_params:
@@ -1455,7 +1255,7 @@ def create_optimizer_for_integrated_model(model, lr=0.0002, weight_decay=0.01):
         })
 
     # 5. 其他参数（较低学习率）
-    # [修复] 使用精确的关键字排除，避免text_adapter等被意外遗漏
+    # 使用参数对象去重，确保共享 MCA 只加入优化器一次。
     already_assigned = set()
     for group in param_groups:
         for param in group['params']:
@@ -1475,6 +1275,9 @@ def create_optimizer_for_integrated_model(model, lr=0.0002, weight_decay=0.01):
         })
 
     # 创建优化器
+    for group in param_groups:
+        group["params"] = [p for p in group["params"] if p.requires_grad]
+    param_groups = [g for g in param_groups if g["params"]]
     optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
 
     print(f"优化器参数组:")
@@ -1560,7 +1363,6 @@ def train_integrated_model(
 
             hyper_cond = {
                 'threshold': tau,
-                'boundary_weight': boundary_weight
             }
 
             # ========== 获取VLM描述和特征 ==========
@@ -1605,7 +1407,7 @@ def train_integrated_model(
                     total_loss, dice_ce_loss, boundary_loss = seg_loss(
                         logits, gt2D, boundary_weight
                     )
-                    total_loss = total_loss + rank_dice_loss
+
 
                 # 反向传播
                 scaler.scale(total_loss).backward()
@@ -1629,7 +1431,7 @@ def train_integrated_model(
                 total_loss, dice_ce_loss, boundary_loss = seg_loss(
                     logits, gt2D, boundary_weight
                 )
-                total_loss = total_loss + rank_dice_loss
+
 
                 # 反向传播
                 total_loss.backward()
@@ -1805,7 +1607,7 @@ def evaluate_model(model, dataloader, processor, vlm_model, tokenizer, mamba_mod
                 text_embeddings=text_features,
                 image_features=image_features,
                 gt_mask=None,
-                hyper_cond={'threshold': 0.5, 'boundary_weight': 1.0},
+                hyper_cond={'threshold': 0.5},
                 return_logits=False
             )
 
@@ -1849,7 +1651,6 @@ def inference_integrated_model(
         image_features,
         device="cuda",
         threshold=0.5,
-        boundary_weight=1.0,
         use_rankdice=True,
 ):
     """使用集成模型进行推理"""
@@ -1858,7 +1659,6 @@ def inference_integrated_model(
 
     hyper_cond = {
         'threshold': threshold,
-        'boundary_weight': boundary_weight
     }
 
     with torch.no_grad():
@@ -1882,7 +1682,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="训练集成的MMSAM模型")
     parser.add_argument("--sam_checkpoint", type=str, required=True, help="SAM预训练权重路径")
-    parser.add_argument("--model_type", type=str, default="vit_l", choices=["vit_b", "vit_l", "vit_h"],
+    parser.add_argument("--model_type", type=str, default="vit_h", choices=["vit_b", "vit_l", "vit_h"],
                         help="SAM模型类型")
     parser.add_argument("--data_root", type=str, required=True, help="数据根目录")
     parser.add_argument("--batch_size", type=int, default=1, help="批次大小")

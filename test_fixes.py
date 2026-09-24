@@ -62,29 +62,17 @@ except Exception as e:
     sys.exit(1)
 
 
-# ==================== 测试2: C3修复 - RankDice梯度可回传 ====================
-test_section("测试2: C3修复 - RankDice软阈值梯度")
+# Final-setting regression: RankDice must not create a training loss.
+test_section("RankDice inference-only")
 try:
-    rankdice = RankDiceRMAModule(use_in_training=True, weight=0.1)
-    rankdice.train()
-
-    # 模拟输入
-    logits = torch.randn(2, 1, 64, 64, requires_grad=True)
-    gt_mask = (torch.rand(2, 1, 64, 64) > 0.5).float()
-
-    result_logits, rank_loss = rankdice(logits, gt_mask)
-    test("RankDice前向传播成功", True)
-    test("rank_loss是Tensor", isinstance(rank_loss, torch.Tensor))
-    test("rank_loss非零", rank_loss.item() != 0.0, f"loss={rank_loss.item()}")
-
-    # 关键：检查梯度能否回传
-    rank_loss.backward()
-    test("rank_loss梯度回传成功", logits.grad is not None)
-    test("logits梯度非零", logits.grad is not None and logits.grad.abs().sum().item() > 0,
-         f"grad_sum={logits.grad.abs().sum().item() if logits.grad is not None else 'None'}")
-except Exception as e:
-    test("C3修复测试", False, traceback.format_exc())
-
+    rankdice = RankDiceRMAModule()
+    logits = torch.randn(2, 1, 16, 16, requires_grad=True)
+    test("training bypass", rankdice(logits) is logits)
+    test("no trainable parameters", sum(p.numel() for p in rankdice.parameters()) == 0)
+    rankdice.eval()
+    test("binary inference", set(rankdice(logits).unique().tolist()) <= {0.0, 1.0})
+except Exception:
+    test("RankDice inference-only", False, traceback.format_exc())
 
 # ==================== 测试3: M1修复 - Sinkhorn直接输入 ====================
 test_section("测试3: M1修复 - Sinkhorn投影")
@@ -176,7 +164,7 @@ try:
     hyper_cond = HyperCondModule(cond_dim=128, hidden_dim=64)
     hyper_cond.eval()  # 推理模式
 
-    cond = hyper_cond(0.5, 1.0, 'cpu', batch_size=2)
+    cond = hyper_cond(0.5, 'cpu', batch_size=2)
     test("HyperCond eval模式前向成功", True)
     test("条件嵌入形状正确", cond.shape == (2, 128),
          f"期望(2,128), 实际{cond.shape}")
@@ -217,16 +205,16 @@ except Exception as e:
 test_section("测试8: BoundaryAwareLoss")
 try:
     loss_fn = BoundaryAwareLoss(alpha=1.0, beta=0.1)
-    pred = torch.randn(2, 1, 64, 64)
+    pred = torch.randn(2, 1, 64, 64, requires_grad=True)
     gt = (torch.rand(2, 1, 64, 64) > 0.5).float()
 
     total_loss, dice_ce_loss, boundary_loss = loss_fn(pred, gt)
     test("损失计算成功", True)
     test("总损失非零", total_loss.item() > 0)
-    test("总损失可回传", True)
+    test("总损失可回传", total_loss.requires_grad)
 
     total_loss.backward()
-    test("梯度回传成功", pred.grad is None)  # pred没有requires_grad
+    test("梯度回传成功", pred.grad is not None and torch.isfinite(pred.grad).all().item())
 except Exception as e:
     test("BoundaryAwareLoss测试", False, traceback.format_exc())
 
@@ -342,7 +330,8 @@ try:
          f"遗漏参数: {missing_params}")
 
     # 特别检查之前遗漏的关键参数
-    critical_names = ['text_adapter', 'cond_channel_adapter', 'cond_spatial_adapter']
+    critical_names = ['prompt_generator', 'pseudo_mask_embed',
+                      'cond_channel_adapter', 'cond_spatial_adapter']
     for crit_name in critical_names:
         found = False
         for name, param in model_full.named_parameters():

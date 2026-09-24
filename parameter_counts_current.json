@@ -1,0 +1,104 @@
+{
+  "configuration": {
+    "backbone": "vit_h",
+    "image_size": 1024,
+    "n_streams": 4,
+    "cspg_temperature": 1.0,
+    "cspg_iters": 5
+  },
+  "scope": "Registered integrated model parameters; excludes separately loaded BLIP and Mamba; no checkpoint loaded, no training performed.",
+  "source_sha256": "3a612ca1426e2a57a6245810c1a9f6f399a4b358f080c00cabb12d6457496b9b",
+  "modules": {
+    "SAM image encoder (original)": {
+      "total": 637026048,
+      "trainable": 0,
+      "frozen": 637026048,
+      "tensors": 457
+    },
+    "MCA": {
+      "total": 580276,
+      "trainable": 580276,
+      "frozen": 0,
+      "tensors": 14
+    },
+    "BLIP feature alignment": {
+      "total": 99584,
+      "trainable": 99584,
+      "frozen": 0,
+      "tensors": 3
+    },
+    "mask_decoder": {
+      "total": 4058340,
+      "trainable": 4058340,
+      "frozen": 0,
+      "tensors": 120
+    },
+    "prompt_encoder": {
+      "total": 6220,
+      "trainable": 0,
+      "frozen": 6220,
+      "tensors": 16
+    },
+    "prompt_generator": {
+      "total": 100868,
+      "trainable": 100868,
+      "frozen": 0,
+      "tensors": 8
+    },
+    "hyper_cond": {
+      "total": 75264,
+      "trainable": 75264,
+      "frozen": 0,
+      "tensors": 14
+    },
+    "cond_channel_adapter": {
+      "total": 32768,
+      "trainable": 32768,
+      "frozen": 0,
+      "tensors": 1
+    },
+    "cond_spatial_adapter": {
+      "total": 68096,
+      "trainable": 68096,
+      "frozen": 0,
+      "tensors": 3
+    },
+    "pseudo_mask_embed": {
+      "total": 136192,
+      "trainable": 136192,
+      "frozen": 0,
+      "tensors": 6
+    }
+  },
+  "total": 642183656,
+  "trainable": 5151388,
+  "frozen": 637032268,
+  "trainable_percent": 0.8021674098787716,
+  "optimizer_groups": [
+    {
+      "name": "encoder_adapters",
+      "scalars": 679860,
+      "tensors": 17,
+      "lr": 5e-05
+    },
+    {
+      "name": "prompt_generator",
+      "scalars": 100868,
+      "tensors": 8,
+      "lr": 2.5e-05
+    },
+    {
+      "name": "hyper_cond",
+      "scalars": 176128,
+      "tensors": 18,
+      "lr": 5e-06
+    },
+    {
+      "name": "others",
+      "scalars": 4194532,
+      "tensors": 126,
+      "lr": 5.000000000000001e-07
+    }
+  ],
+  "rankdice_parameters": 0
+}

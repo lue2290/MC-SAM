@@ -7,12 +7,14 @@
 # %% 设置环境
 import os
 import sys
+import random
 import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 import argparse
 import shutil
 import matplotlib
+
 matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']  # 中文字体
 matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
@@ -40,36 +42,58 @@ from segment_anything.modeling.mcsam_integrated import (
     evaluate_model
 )
 
-# 导入评估指标（如果存在）
-try:
-    from utils_downstream.saliency_metric import cal_mae, cal_sm, cal_em, cal_wfm, cal_dice, cal_iou, cal_ber, cal_acc
-except ImportError:
-    print("警告: 未找到评估指标模块，使用简化版本")
-
-
-    # 创建简化的评估指标类
-    class SimpleMetric:
-        def __init__(self):
-            self.values = []
-
-        def update(self, pred, gt):
-            # 简单实现，实际应该计算指标
-            self.values.append(0.5)
-
-        def show(self):
-            return np.mean(self.values) if self.values else 0.0
-
-
-    # 创建别名
-    cal_mae = cal_sm = cal_em = cal_wfm = cal_dice = cal_iou = cal_ber = cal_acc = SimpleMetric
-
-# 设置随机种子
-torch.manual_seed(2024)
-np.random.seed(2024)
+from utils_downstream.saliency_metric import (
+    cal_mae, cal_sm, cal_em, cal_wfm, cal_dice, cal_iou, cal_ber, cal_acc,
+)
 
 # 设置环境变量
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 os.environ['HF_HUB_OFFLINE'] = '0'  # 使用在线模式
+
+
+# %% 随机种子设置
+def set_seed(seed: int = 42, deterministic: bool = False):
+    """
+    统一设置所有随机种子，保证实验可复现。
+
+    Args:
+        seed: 随机种子
+        deterministic: 是否启用 cuDNN 确定性（会牺牲训练速度，
+                       但能显著提高可复现性）
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # 让 Python 的哈希也稳定
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        # 更严格但更慢；某些算子不支持时会报错，可先不开
+        # torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+    print(f"[set_seed] seed={seed}, deterministic={deterministic}")
+
+
+def seed_worker(worker_id: int):
+    """DataLoader worker 的随机种子初始化函数"""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+def make_generator(seed: int) -> torch.Generator:
+    """创建带固定种子的 torch.Generator"""
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return g
 
 
 # %% 数据集定义
@@ -189,7 +213,7 @@ def eval_psnr(loader, model, vlm_model, processor, mamba_model, tokenizer, devic
                 text_embeddings=text_features,
                 image_features=image_features,
                 gt_mask=None,
-                hyper_cond={'threshold': 0.5, 'boundary_weight': 1.0},
+                hyper_cond={'threshold': 0.5},
                 return_logits=False
             )
 
@@ -241,15 +265,17 @@ def parse_args():
                         help="训练数据路径")
     parser.add_argument("--val_data", type=str,
                         default="/root/autodl-tmp/data/COD10K+CAMO/COD10K_CAMO_CombinedTestingDataset/TestingDataset",
-                        help="验证数据路径")
-    parser.add_argument("--val_sample_size", type=int, default=1000,
-                        help="验证集采样大小")
+                        help="官方测试集路径（训练时不读取，仅保留用于最终测试）")
+    parser.add_argument("--val_sample_size", type=int, default=404,
+                        help="从训练集中固定划出的验证样本数（默认404）")
+    parser.add_argument("--split_seed", type=int, default=42,
+                        help="训练/验证集固定划分种子；不同训练seed和对比方法应保持一致")
 
     # 模型参数
     parser.add_argument("--sam_checkpoint", type=str,
-                        default="/root/autodl-tmp/MMsam/sam/sam_vit_l_0b3195.pth",
+                        default="/root/autodl-tmp/MMsam/sam/sam_vit_h_4b8939.pth",
                         help="SAM预训练权重路径")
-    parser.add_argument("--model_type", type=str, default="vit_l",
+    parser.add_argument("--model_type", type=str, default="vit_h",
                         choices=["vit_b", "vit_l", "vit_h"],
                         help="SAM模型类型")
     parser.add_argument("--blip_path", type=str,
@@ -271,6 +297,12 @@ def parse_args():
     parser.add_argument("--weight_decay", type=float, default=0.01,
                         help="权重衰减")
 
+    # 随机种子
+    parser.add_argument("--seed", type=int, default=42,
+                        help="随机种子，默认42；多seed实验时分别传入 42/123/2024/3407/0 等")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="启用 cuDNN 确定性模式，牺牲速度换可复现性")
+
     # 其他参数
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="训练设备")
@@ -288,11 +320,17 @@ def parse_args():
     # 模型特定参数
     parser.add_argument("--n_streams", type=int, default=4,
                         help="流形约束适配器的流数量")
+    parser.add_argument("--mca_bottleneck_dim", type=int, default=128,
+                        help="三个插入位置共享的MCA瓶颈维度")
+    parser.add_argument("--projection_rank", type=int, default=48,
+                        help="BLIP对齐与跨模态提示投影的低秩维度")
     parser.add_argument("--use_rankdice", action="store_true", default=True,
                         help="使用RankDice-RMA模块")
     parser.add_argument("--use_hypercond", action="store_true", default=True,
                         help="使用超参数条件化")
 
+    parser.add_argument("--cspg_temperature", type=float, default=1.0, help="Gram-affinity temperature; new implementation default")
+    parser.add_argument("--cspg_iters", type=int, default=5, help="CSPG row/column normalization pairs")
     return parser.parse_args()
 
 
@@ -300,17 +338,28 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # === 设置随机种子（最早执行） ===
+    set_seed(args.seed, deterministic=args.deterministic)
+
     # 设置设备
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
-    # 创建工作目录
+    # 创建工作目录：在 task_name 下按 seed 分子目录，便于多 seed 实验
     run_id = datetime.now().strftime("%Y%m%d-%H%M")
-    model_save_path = os.path.join(args.work_dir, args.task_name, run_id)
+    seed_tag = f"seed{args.seed}"
+    model_save_path = os.path.join(args.work_dir, args.task_name, seed_tag, run_id)
     os.makedirs(model_save_path, exist_ok=True)
 
     # 保存当前脚本
     shutil.copyfile(__file__, os.path.join(model_save_path, f"train_{run_id}.py"))
+
+    # 保存参数与种子信息
+    with open(os.path.join(model_save_path, "run_config.txt"), "w", encoding="utf-8") as f:
+        f.write(f"seed = {args.seed}\n")
+        f.write(f"deterministic = {args.deterministic}\n")
+        for k, v in sorted(vars(args).items()):
+            f.write(f"{k} = {v}\n")
 
     # 初始化WandB（如果使用）
     if args.use_wandb:
@@ -318,25 +367,34 @@ def main():
         wandb.login()
         wandb.init(
             project=args.task_name,
-            name=f"{args.task_name}_{run_id}",
+            name=f"{args.task_name}_{seed_tag}_{run_id}",
             config=vars(args)
         )
 
     # %% 创建数据集和数据加载器
     print("加载数据集...")
-    train_dataset = NpyDataset(args.train_data)
-    val_dataset = NpyDataset(args.val_data)
+    full_train_dataset = NpyDataset(args.train_data)
 
-    # 创建验证集子集
-    if len(val_dataset) > args.val_sample_size:
-        indices = torch.randperm(len(val_dataset))[:args.val_sample_size]
-        val_subset = Subset(val_dataset, indices)
-        print(f"验证集: 从 {len(val_dataset)} 张图片中随机选择 {args.val_sample_size} 张")
-    else:
-        val_subset = val_dataset
-        print(f"验证集: 使用全部 {len(val_dataset)} 张图片")
+    if not 0 < args.val_sample_size < len(full_train_dataset):
+        raise ValueError(
+            f"val_sample_size 必须在 1 到 {len(full_train_dataset) - 1} 之间，"
+            f"当前为 {args.val_sample_size}"
+        )
 
-    print(f"训练集: {len(train_dataset)} 张图片")
+    # 仅从训练集做一次固定划分；官方测试集不参与训练或选模。
+    split_generator = make_generator(args.split_seed)
+    indices = torch.randperm(len(full_train_dataset), generator=split_generator).tolist()
+    val_indices = indices[:args.val_sample_size]
+    train_indices = indices[args.val_sample_size:]
+    train_dataset = Subset(full_train_dataset, train_indices)
+    val_subset = Subset(full_train_dataset, val_indices)
+
+    print(f"训练集划分: {len(train_dataset)} 张")
+    print(f"验证集划分: {len(val_subset)} 张（split_seed={args.split_seed}，固定不变）")
+    print(f"官方测试集: {args.val_data}（训练阶段不读取）")
+
+    # 训练集 shuffle 使用独立 generator，避免影响固定的数据划分。
+    train_generator = make_generator(args.seed)
 
     train_loader = DataLoader(
         train_dataset,
@@ -344,7 +402,9 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        worker_init_fn=seed_worker,
+        generator=train_generator,
     )
 
     val_loader = DataLoader(
@@ -352,35 +412,42 @@ def main():
         batch_size=1,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True
+        pin_memory=True,
+        worker_init_fn=seed_worker,
     )
 
     # %% 加载VLM和文本模型
     print("加载VLM和文本模型...")
     processor = BlipProcessor.from_pretrained(args.blip_path)
     vlm_model = BlipForConditionalGeneration.from_pretrained(args.blip_path).to(device)
-    vlm_model.eval()  # VLM模型在训练时固定
+    vlm_model.eval()
+    vlm_model.requires_grad_(False)
 
     tokenizer = AutoTokenizer.from_pretrained(args.mamba_path)
     mamba_model = MambaModel.from_pretrained(args.mamba_path).to(device)
-    mamba_model.eval()  # Mamba模型在训练时固定
+    mamba_model.eval()
+    mamba_model.requires_grad_(False)
 
     # %% 创建集成模型
     print("创建集成模型...")
     model = create_integrated_model(
         sam_checkpoint_path=args.sam_checkpoint,
         model_type=args.model_type,
+        cspg_temperature=args.cspg_temperature,
+        cspg_iters=args.cspg_iters,
         image_size=1024,
         use_rankdice=args.use_rankdice,
         use_hypercond=args.use_hypercond,
         n_streams=args.n_streams,
+        mca_bottleneck_dim=args.mca_bottleneck_dim,
+        projection_rank=args.projection_rank,
         device=device,
         blip_feature_dim=768
     )
 
     # 冻结SAM图像编码器的大部分参数（除了适配器）
     for name, param in model.image_encoder.named_parameters():
-        if "adapter" in name or "manifold_adapters" in name or "blip_feature_adjust" in name:
+        if "adapter" in name or "blip_feature_adjust" in name:
             param.requires_grad = True
         else:
             param.requires_grad = False
@@ -391,6 +458,25 @@ def main():
     print(f"总参数量: {total_params:,}")
     print(f"可训练参数量: {trainable_params:,}")
     print(f"训练参数比例: {trainable_params / total_params * 100:.2f}%")
+
+    # 分模块核对参数预算，vit_h 默认配置目标约 5.1M。
+    budget_modules = {
+        "SAM mask decoder": model.mask_decoder,
+        "共享 MCA": model.image_encoder.shared_manifold_adapter,
+        "BLIP 低秩对齐": model.image_encoder.blip_feature_adjust,
+        "CSPG 低秩提示": model.prompt_generator,
+        "Dense prompt": model.pseudo_mask_embed,
+    }
+    if args.use_hypercond:
+        budget_modules.update({
+            "HyperCond": model.hyper_cond,
+            "HyperCond channel": model.cond_channel_adapter,
+            "HyperCond spatial": model.cond_spatial_adapter,
+        })
+    print("可训练参数分模块统计:")
+    for module_name, module in budget_modules.items():
+        module_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+        print(f"  {module_name}: {module_params:,}")
 
     # %% 创建优化器和损失函数
     print("创建优化器和损失函数...")
@@ -410,8 +496,11 @@ def main():
     # 损失函数
     seg_loss = BoundaryAwareLoss(alpha=1.0, beta=0.1)
 
-    # Beta分布用于超参数采样
-    beta_dist = Beta(torch.tensor([2.0]), torch.tensor([2.0]))
+    # Beta分布用于超参数采样（使用带 seed 的 generator，保证采样一致）
+    beta_dist = Beta(
+        torch.tensor([2.0]),
+        torch.tensor([2.0])
+    )
 
     # 混合精度训练
     scaler = torch.cuda.amp.GradScaler() if args.use_amp else None
@@ -448,7 +537,7 @@ def main():
     print("开始训练...")
     for epoch in range(start_epoch, args.num_epochs):
         print(f"\n{'=' * 50}")
-        print(f"Epoch {epoch + 1}/{args.num_epochs}")
+        print(f"Epoch {epoch + 1}/{args.num_epochs}  (seed={args.seed})")
         print(f"{'=' * 50}")
 
         # 训练阶段
@@ -478,7 +567,6 @@ def main():
 
             hyper_cond = {
                 'threshold': tau,
-                'boundary_weight': boundary_weight
             }
 
             # === 获取VLM描述和特征 ===
@@ -526,7 +614,7 @@ def main():
                     total_loss, dice_ce_loss, boundary_loss = seg_loss(
                         logits, gt2D, boundary_weight
                     )
-                    total_loss = total_loss + rank_dice_loss
+
 
                 # 反向传播
                 scaler.scale(total_loss).backward()
@@ -553,7 +641,7 @@ def main():
                 total_loss, dice_ce_loss, boundary_loss = seg_loss(
                     logits, gt2D, boundary_weight
                 )
-                total_loss = total_loss + rank_dice_loss
+
 
                 # 反向传播
                 total_loss.backward()
@@ -655,9 +743,15 @@ def main():
                 "val_iou": val_metrics['iou'],
                 "val_ber": val_metrics['ber'],
                 "val_score": val_score,
+                "seed": args.seed,
             })
 
         # === 保存模型 ===
+        previous_best_score = best_val_score
+        is_best = val_score > best_val_score
+        if is_best:
+            best_val_score = val_score
+
         # 保存最新模型
         checkpoint_latest = {
             'epoch': epoch,
@@ -669,15 +763,14 @@ def main():
             'val_score': val_score,
             'best_val_score': best_val_score,
             'train_history': train_history,
-            'args': vars(args)
+            'args': vars(args),
+            'seed': args.seed,
         }
 
         torch.save(checkpoint_latest, os.path.join(model_save_path, "model_latest.pth"))
 
         # 保存最佳模型
-        if val_score > best_val_score:
-            best_val_score = val_score
-
+        if is_best:
             checkpoint_best = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -688,11 +781,12 @@ def main():
                 'val_score': val_score,
                 'best_val_score': best_val_score,
                 'train_history': train_history,
-                'args': vars(args)
+                'args': vars(args),
+                'seed': args.seed,
             }
 
             torch.save(checkpoint_best, os.path.join(model_save_path, "model_best.pth"))
-            print(f"✅ 保存最佳模型，验证分数: {val_score:.4f} (之前最佳: {best_val_score:.4f})")
+            print(f"✅ 保存最佳模型，验证分数: {val_score:.4f} (之前最佳: {previous_best_score:.4f})")
 
         # 定期保存检查点
         if (epoch + 1) % 5 == 0:
@@ -706,7 +800,8 @@ def main():
                 'val_score': val_score,
                 'best_val_score': best_val_score,
                 'train_history': train_history,
-                'args': vars(args)
+                'args': vars(args),
+                'seed': args.seed,
             }
 
             torch.save(checkpoint_epoch, os.path.join(model_save_path, f"model_epoch_{epoch + 1}.pth"))
@@ -721,7 +816,7 @@ def main():
         plt.plot(train_history['train_boundary_loss'], label='Boundary Loss')
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
-        plt.title('Training Loss')
+        plt.title(f'Training Loss (seed={args.seed})')
         plt.legend()
         plt.grid(True)
 
@@ -790,6 +885,7 @@ def main():
     # 训练完成
     print(f"\n{'=' * 50}")
     print(f"训练完成!")
+    print(f"Seed: {args.seed}")
     print(f"最佳验证分数: {best_val_score:.4f}")
     print(f"模型保存至: {model_save_path}")
     print(f"{'=' * 50}")

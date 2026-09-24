@@ -1,94 +1,70 @@
 # MC-SAM
 
-**用于伪装目标分割的稳定性约束 SAM 适配研究。**
+Code for *MC-SAM: A Stability-Constrained Coupled Adaptation Framework for SAM in Camouflaged Scene Segmentation*.
 
-A research implementation of **MC-SAM: A Stability-Constrained Coupled Adaptation Framework for SAM in Camouflaged Scene Segmentation**.
+MC-SAM builds on MM-SAM and uses a frozen SAM ViT-H image encoder, frozen BLIP and Mamba cue extractors, and a trainable SAM mask decoder. A shared bottleneck MCA is called at three image-encoder positions. CSPG generates sparse prompts. HyperCond supplies threshold conditioning to the dense prompt. RankDice-RMA is used only during inference and does not enter the training loss.
 
-伪装目标与背景具有相似的纹理和外观，稳定地融合视觉与文本信息是分割过程中的关键问题。本项目在 SAM 视觉分割框架中引入多流融合适配、跨模态提示、超参数条件化以及 RankDice-RMA 模块，提供模型训练、检查点加载与掩码推理源码。
+## Source layout
 
-## 核心组成
+- `MCsam_train.py`: training, fixed train/validation split, checkpoint selection.
+- `inference_mcsam.py`: loading a trained checkpoint and saving prediction masks.
+- `segment_anything/modeling/mcsam_integrated.py`: MC-SAM model and losses.
+- `config_mcsam.py`: default configuration.
+- `count_model_parameters.py`: parameter accounting without loading pretrained checkpoints.
+- `test_final_settings.py` and `test_fixes.py`: local component checks.
 
-| 组件 | 代码中的功能 |
-| --- | --- |
-| SAM | 图像编码与掩码解码 |
-| BLIP 与 Mamba | 视觉/文本描述及文本特征处理 |
-| Sinkhorn 约束融合 | 用双随机混合权重构建多流特征融合 |
-| 跨模态提示生成器 | 融合文本和视觉信息，生成分割提示 |
-| HyperCond | 将阈值与边界权重编码到模型条件信息中 |
-| RankDice-RMA | 排序相关损失与推理后处理 |
+## Inputs and environment
 
-这些模块的主要实现位于 `segment_anything/modeling/mcsam_integrated.py`。源码版本的详细结构见 [实现笔记](docs/IMPLEMENTATION_NOTES.md)；笔记中的预期测试结果不代表本次已执行验证。
+Install PyTorch, torchvision, transformers, MONAI, NumPy, SciPy, Pillow, matplotlib and tqdm in a compatible Python environment. Obtain the SAM ViT-H checkpoint and the BLIP and Mamba models used by MM-SAM separately. The cue models correspond to `Salesforce/blip-image-captioning-large` and `state-spaces/mamba-130m-hf`. Pretrained and trained weights, as well as COD images, are not included in this repository.
 
-## 仓库结构
+The training directory must contain paired files in `Imgs/` and `GT/`, for example:
 
 ```text
-MCsam_train.py          # 训练、数据读取、验证与检查点保存
-inference_mcsam.py      # 模型加载、掩码预测与可视化
-config_mcsam.py         # 集成模型配置
-segment_anything/      # SAM 组件及集成模型
-utils_downstream/      # 数据工具、损失与评估指标
-test_fixes.py          # 原项目的模块检查脚本
-docs/                  # 原版本实现笔记
+combined_train/
+  Imgs/0001.jpg
+  GT/0001.png
 ```
 
-## 环境与模型准备
+The loader sorts image and mask filenames separately and checks their counts. Confirm that paired stems match before training. The expected pool combines 3,040 COD10K and 1,000 CAMO training images. With the default fixed split, 3,636 images update the model and 404 images select the checkpoint. Official test sets are excluded from this split.
 
-请使用独立 Python 环境，并根据 CUDA 环境安装 PyTorch / torchvision。训练还使用 `transformers`、`monai`、NumPy、SciPy、Pillow、matplotlib 和 tqdm；可选实验记录需要 wandb。原环境未提供锁定依赖文件，因此这里不声称任意最新版依赖都兼容。
-
-训练前准备：
-
-1. SAM 预训练权重，与 `--model_type` 一致。
-2. BLIP 和 Mamba 的本地模型目录。
-3. 配对图像与二值分割标签。
-
-```text
-dataset/
-├── Imgs/
-│   ├── 0001.jpg
-│   └── 0002.jpg
-└── GT/
-    ├── 0001.png
-    └── 0002.png
-```
-
-图像与掩码必须在文件排序后正确对应；运行前请检查配对关系。数据集和预训练/训练权重不包含在仓库内。
-
-## 训练
-
-下面为 Bash 示例；Windows PowerShell 可将参数写为单行：
+## Training
 
 ```bash
 python MCsam_train.py \
-  --train_data /path/to/train \
-  --val_data /path/to/val \
-  --sam_checkpoint /path/to/sam_vit_l_0b3195.pth \
-  --model_type vit_l \
+  --train_data /path/to/combined_train \
+  --sam_checkpoint /path/to/sam_vit_h_4b8939.pth \
   --blip_path /path/to/Blip \
   --mamba_path /path/to/mamba \
+  --model_type vit_h \
   --num_epochs 20 --batch_size 1 --lr 0.00005 \
-  --device cuda:0 --work_dir ./work_dir --task_name mcsam_cod
+  --val_sample_size 404 --split_seed 42 \
+  --mca_bottleneck_dim 128 --projection_rank 48 \
+  --cspg_temperature 1.0 --cspg_iters 5 \
+  --work_dir /path/to/output
 ```
 
-可使用 `--resume` 指定检查点恢复训练，使用 `--use_amp` 启用混合精度。完整参数以 `python MCsam_train.py --help` 为准。
+The default optimizer is AdamW with weight decay 0.01 and cosine learning-rate scheduling. Images are resized to 1024×1024 and normalized with ImageNet channel statistics; masks use nearest-neighbor resizing. There is no stochastic image augmentation or patience-based early stopping. Every epoch is evaluated on the fixed validation subset. The selected checkpoint maximizes the mean of validation S-measure, adaptive E-measure and weighted F-measure. A separate `--seed` controls a training run; `--split_seed` holds the validation assignment fixed.
 
-## 推理
+BLIP caption generation uses the pretrained model's default generation configuration. HyperCond samples the threshold condition in [0.4, 0.6]; the sampled boundary weight in [0.3, 1.0] scales only the training boundary loss. RankDice-RMA adds no training loss.
+
+## Inference
 
 ```bash
 python inference_mcsam.py \
-  --model_path /path/to/trained_model.pth \
-  --data_path /path/to/test \
-  --sam_checkpoint /path/to/sam_vit_l_0b3195.pth \
-  --model_type vit_l --save_dir ./results --visualize
+  --model_path /path/to/model_best.pth \
+  --data_path /path/to/test_set \
+  --sam_checkpoint /path/to/sam_vit_h_4b8939.pth \
+  --blip_path /path/to/Blip \
+  --mamba_path /path/to/mamba \
+  --model_type vit_h --save_dir /path/to/predictions
 ```
 
-在运行前检查推理脚本中 BLIP/Mamba 的模型加载设置，使其与本地模型目录及训练配置一致。预测掩码与可视化输出保存到指定结果目录。
+This script expects paired images and masks because it uses the same dataset reader as the validation code. It saves a prediction for each sample. The model checkpoint records the training arguments; loading is strict so an incompatible architecture raises an error.
 
-## 版本与验证说明
+## Parameter accounting
 
-此仓库保存作者指定的 `MCsam` 源码版本，并保留原算法实现。本次整理通过 Python 语法检查，尚未执行完整 GPU 训练或论文指标复现。未提供经本次验证的性能表，不将申请材料中的指标作为该源码快照的复现结果。
+Run `python count_model_parameters.py` from the repository root. For ViT-H, 128-dimensional shared MCA and rank-48 alignment, the integrated segmentation model contains **642,183,656** parameters: **5,151,388 trainable** and **637,032,268 frozen**. The count includes the trainable SAM mask decoder and counts the shared MCA once. Separately loaded frozen BLIP and Mamba models are outside this total. The count script uses a meta device and does not load a checkpoint or run training.
 
-训练脚本含有评估模块导入失败时的占位指标回退逻辑；正式评估前必须确认真实指标模块成功加载，不能将回退值用于报告模型性能。
+## Validation scope
 
-## Acknowledgements
-
-The implementation builds on SAM and uses the PyTorch and Hugging Face ecosystems. Original source notices are retained; third-party components remain subject to their respective licenses.
+The component checks can be run with `python -m unittest test_final_settings test_fixes`. Full benchmark reproduction requires the external datasets, pretrained cue models and a trained checkpoint. The repository does not contain model weights or a complete run artifact.

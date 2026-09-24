@@ -22,14 +22,17 @@ def main():
     parser = argparse.ArgumentParser(description="集成模型推理")
     parser.add_argument("--model_path", type=str, required=True, help="模型检查点路径")
     parser.add_argument("--data_path", type=str, required=True, help="测试数据路径")
-    parser.add_argument("--sam_checkpoint", type=str, default="sam/sam_vit_l_0b3195.pth", help="SAM预训练权重")
-    parser.add_argument("--model_type", type=str, default="vit_l", help="模型类型")
+    parser.add_argument("--sam_checkpoint", type=str, default="sam/sam_vit_h_4b8939.pth", help="SAM预训练权重")
+    parser.add_argument("--blip_path", type=str, default="/root/autodl-tmp/MMsam/Blip", help="BLIP模型目录")
+    parser.add_argument("--mamba_path", type=str, default="/root/autodl-tmp/MMsam/mamba", help="Mamba模型目录")
+    parser.add_argument("--model_type", type=str, default="vit_h", help="模型类型")
     parser.add_argument("--device", type=str, default="cuda:0", help="设备")
     parser.add_argument("--threshold", type=float, default=0.5, help="阈值")
-    parser.add_argument("--boundary_weight", type=float, default=1.0, help="边界权重")
     parser.add_argument("--save_dir", type=str, default="result", help="结果保存目录")
     parser.add_argument("--visualize", action="store_true", help="是否可视化结果")
 
+    parser.add_argument("--cspg_temperature", type=float, default=1.0)
+    parser.add_argument("--cspg_iters", type=int, default=5)
     args = parser.parse_args()
 
     # 创建保存目录
@@ -39,33 +42,44 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"使用设备: {device}")
 
+    checkpoint = torch.load(args.model_path, map_location="cpu")
+    saved_args = checkpoint.get("args", {})
+    for key in ("model_type", "cspg_temperature", "cspg_iters"):
+        if key in saved_args and saved_args[key] != getattr(args, key):
+            raise ValueError(f"Checkpoint {key}={saved_args[key]} differs from requested {getattr(args, key)}")
+
     # 创建模型
     print("加载模型...")
     model = create_integrated_model(
         sam_checkpoint_path=args.sam_checkpoint,
         model_type=args.model_type,
+        cspg_temperature=args.cspg_temperature,
+        cspg_iters=args.cspg_iters,
         image_size=1024,
         use_rankdice=True,
         use_hypercond=True,
         n_streams=4,
+        mca_bottleneck_dim=saved_args.get("mca_bottleneck_dim", 128),
+        projection_rank=saved_args.get("projection_rank", 48),
         device=device
     ).to(device)
 
     # 加载检查点
-    checkpoint = torch.load(args.model_path, map_location=device)
-    if "model" in checkpoint:
-        model.load_state_dict(checkpoint["model"], strict=False)
+    if "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    elif "model" in checkpoint:
+        model.load_state_dict(checkpoint["model"], strict=True)
     else:
-        model.load_state_dict(checkpoint, strict=False)
+        model.load_state_dict(checkpoint, strict=True)
 
     model.eval()
 
     # 加载VLM和Mamba模型
     os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-    processor = BlipProcessor.from_pretrained("/root/autodl-tmp/MMsam/Blip")
-    vlm_model = BlipForConditionalGeneration.from_pretrained("/root/autodl-tmp/MMsam/Blip").to(device)
-    tokenizer = AutoTokenizer.from_pretrained("/root/autodl-tmp/MMsam/mamba")
-    mamba_model = MambaModel.from_pretrained("/root/autodl-tmp/MMsam/mamba").to(device)
+    processor = BlipProcessor.from_pretrained(args.blip_path)
+    vlm_model = BlipForConditionalGeneration.from_pretrained(args.blip_path).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(args.mamba_path)
+    mamba_model = MambaModel.from_pretrained(args.mamba_path).to(device)
 
     vlm_model.eval()
     mamba_model.eval()
@@ -119,7 +133,6 @@ def main():
             # 超参数条件
             hyper_cond = {
                 'threshold': args.threshold,
-                'boundary_weight': args.boundary_weight
             }
 
             # 模型推理
